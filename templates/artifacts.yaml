@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket artifact bucket - the hand-off between the app repo and the pipeline
+
+# Unconditional, unlike the pipeline that reads it. The app repo uploads its
+# deploy descriptors here on every build, including the builds that happen
+# before DeployApplication flips to true. If this bucket only existed
+# alongside the pipeline, the first deployment would have nothing to read.
+
+Parameters:
+  ProjectName:
+    Type: String
+
+  ArtifactBucketName:
+    Type: String
+
+Resources:
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    # Delete, not Retain: nothing here is precious. make empty clears it first.
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Ref ArtifactBucketName
+      # Required, not optional: a CodePipeline S3 source action reads an
+      # object version, and refuses a bucket that cannot give it one.
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          # Without this the bucket grows a couple of megabytes per deployment.
+          - Id: expire-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+          # Versioning is on for the source action's benefit, so the old
+          # versions need their own expiry or they accumulate forever.
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # Read by the app repo's workflow, so it uploads where the pipeline looks.
+  ArtifactBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/artifact-bucket'
+      Type: String
+      Value: !Ref ArtifactBucket
+
+Outputs:
+  BucketName:
+    Value: !Ref ArtifactBucket
+
+  BucketArn:
+    Value: !GetAtt ArtifactBucket.Arn

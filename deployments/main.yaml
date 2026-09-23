@@ -1,0 +1,15 @@
+# Git sync deploys the packaged file CI writes. Everything account-specific
+# resolves from Parameter Store, so it is not repeated here.
+template-file-path: main.packaged.yaml
+
+parameters:
+  # false on the first pass: the service cannot start before CI has pushed an
+  # image. Flip to true and push; that commit is the trigger.
+  DeployApplication: 'false'
+
+tags:
+  Project: docket
+  Environment: dev
+  Owner: jamillah.ssozi
+  ManagedBy: cloudformation-gitsync
+  CostCentre: training

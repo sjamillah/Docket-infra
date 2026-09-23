@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket security groups - six groups and every rule between them
+
+Parameters:
+  ProjectName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  ContainerPort:
+    Type: Number
+    MinValue: 1
+    MaxValue: 65535
+    Description: Passed from main.yaml, and what the target groups and container use.
+
+  DbPort:
+    Type: Number
+    MinValue: 1
+    MaxValue: 65535
+    Description: Passed from main.yaml, and the port the database actually listens on.
+
+  CachePort:
+    Type: Number
+    MinValue: 1
+    MaxValue: 65535
+    Description: Passed from main.yaml, and the port the replication group listens on.
+
+  VpcCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >-
+      What the interface endpoints accept HTTPS from. A CIDR rather than the
+      task group: the endpoint ENIs serve the whole VPC, and naming the group
+      would couple two resources that have no reason to know each other.
+
+  S3PrefixListId:
+    Type: String
+    Description: >-
+      Published by the bootstrap stack. S3 is reached through a gateway
+      endpoint, which has no security group, so egress to it can only be
+      expressed as a prefix list.
+
+Resources:
+
+  # Two rules per flow, deliberately. Egress is inline on the source group,
+  # because omitting it leaves the default allow-all outbound in place.
+  # Ingress on the destination group is a separate resource, which is what
+  # breaks the cycle when two groups would otherwise name each other.
+  #
+  # A group with nothing to reach out to still needs an explicit egress rule,
+  # or CloudFormation leaves the default allow-all in place. 127.0.0.1/32 is
+  # the conventional way to say "none": it is syntactically a rule and
+  # semantically unreachable. Statefulness covers replies to traffic these
+  # groups receive; it does not cover traffic they start, and they start none.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB, accepts HTTP from the internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          DestinationSecurityGroupId: !Ref EcsSecurityGroup
+          Description: Traffic to the containers
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks, ALB inbound and AWS-service outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref VpcEndpointSecurityGroup
+          Description: ECR, CloudWatch Logs, Secrets Manager, SSM Messages
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+          Description: S3 gateway endpoint, where ECR keeps image layers
+        - IpProtocol: tcp
+          FromPort: !Ref DbPort
+          ToPort: !Ref DbPort
+          DestinationSecurityGroupId: !Ref ProxySecurityGroup
+          Description: PostgreSQL through the proxy
+        - IpProtocol: tcp
+          FromPort: !Ref CachePort
+          ToPort: !Ref CachePort
+          DestinationSecurityGroupId: !Ref CacheSecurityGroup
+          Description: Redis
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-sg'
+
+  # The proxy is the only client the database ever sees.
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Proxy, accepts from the tasks and connects to the database
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref DbPort
+          ToPort: !Ref DbPort
+          DestinationSecurityGroupId: !Ref DbSecurityGroup
+          Description: The pooled connections the proxy holds open
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proxy-sg'
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL, reachable only from the proxy
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: Closed - this group never initiates
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-sg'
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis, reachable only from the tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: Closed - this group never initiates
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cache-sg'
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoint ENIs, HTTPS from the tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: Closed - this group never initiates
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpce-sg'
+
+  # --- Ingress --------------------------------------------------------------
+
+  # Separate resources: a group cannot name in its own ingress a group that
+  # names it back, which is the circular dependency the AWS examples warn about.
+
+  EcsFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: The load balancer
+
+  EndpointsFromVpcIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VpcEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref VpcCidr
+      Description: HTTPS from inside the VPC
+
+  ProxyFromEcsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ProxySecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DbPort
+      ToPort: !Ref DbPort
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: Connections from the application tasks
+
+  DbFromProxyIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DbPort
+      ToPort: !Ref DbPort
+      SourceSecurityGroupId: !Ref ProxySecurityGroup
+      Description: PostgreSQL from the proxy, and from nothing else
+
+  CacheFromEcsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CacheSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref CachePort
+      ToPort: !Ref CachePort
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: Redis from the application tasks
+
+Outputs:
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+
+  EcsSecurityGroupId:
+    Value: !Ref EcsSecurityGroup
+
+  ProxySecurityGroupId:
+    Value: !Ref ProxySecurityGroup
+
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+
+  CacheSecurityGroupId:
+    Value: !Ref CacheSecurityGroup
+
+  VpcEndpointSecurityGroupId:
+    Value: !Ref VpcEndpointSecurityGroup

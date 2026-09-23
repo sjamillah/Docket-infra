@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket alerting - the topic every alarm and the pipeline publish to
+
+Parameters:
+  ProjectName:
+    Type: String
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$'
+    ConstraintDescription: An email address, or blank for no subscription.
+    Description: Leave blank to create the topic without a subscription.
+
+Conditions:
+  HasAlertEmail: !Not
+    - !Equals
+      - !Ref AlertEmail
+      - ''
+
+Resources:
+
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: !Sub '${ProjectName} alerts'
+
+  # Both publish on their own behalf; without this, alarms fire into nothing.
+  TopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref Topic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowServicesToPublish
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref Topic
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref AWS::AccountId
+
+  # AWS emails a confirmation link that has to be clicked first.
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+Outputs:
+  TopicArn:
+    Value: !Ref Topic

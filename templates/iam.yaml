@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket IAM - every role except the ones needed before this stack exists
+
+Parameters:
+  ProjectName:
+    Type: String
+
+  # Passed from main.yaml: roles precede the resources they grant access to.
+  ArtifactBucketName:
+    Type: String
+  EcrRepositoryArn:
+    Type: String
+  GitHubOrg:
+    Type: String
+  GitHubAppRepo:
+    Type: String
+  GitHubBranch:
+    Type: String
+  PipelineName:
+    Type: String
+
+Resources:
+
+  # --- Database -------------------------------------------------------------
+
+  # Matching rds!db-* rather than the ARN keeps this out of a cycle.
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-proxy'
+      Description: Lets RDS Proxy read the master credentials RDS generated
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: read-managed-master-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!db-*'
+              - Effect: Allow
+                Action: 'kms:Decrypt'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+
+  # --- ECS ------------------------------------------------------------------
+
+  # The agent, before the application starts: image, secret, log stream.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!db-*'
+
+  # Needs no AWS API access beyond Exec: it reaches both stores over the network.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # How you diagnose a task that cannot reach the proxy or the cache.
+              - Effect: Allow
+                Action:
+                  - 'ssmmessages:CreateControlChannel'
+                  - 'ssmmessages:CreateDataChannel'
+                  - 'ssmmessages:OpenControlChannel'
+                  - 'ssmmessages:OpenDataChannel'
+                Resource: '*'
+
+  # --- Deployment -----------------------------------------------------------
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codedeploy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: pipeline-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Artifacts
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*'
+              - Sid: ReadEcr
+                Effect: Allow
+                Action:
+                  - 'ecr:DescribeImages'
+                  - 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Sid: DriveCodeDeploy
+                Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:GetApplication'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource: '*'
+              - Sid: RegisterTaskDefinitions
+                Effect: Allow
+                Action:
+                  - 'ecs:RegisterTaskDefinition'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:DescribeServices'
+                Resource: '*'
+              - Sid: PassTaskRoles
+                Effect: Allow
+                Action: 'iam:PassRole'
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+                Condition:
+                  StringEquals:
+                    # These roles can go to ECS and nowhere else.
+                    'iam:PassedToService': ecs-tasks.amazonaws.com
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-pipeline'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'codepipeline:StartPipelineExecution'
+                Resource: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}'
+
+  GitHubAppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-gha-app'
+      Description: GitHub Actions in the application repo, pushing images to ECR
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                # GitHub appends numeric ids on rename; the literal @ anchors it.
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOrg}/${GitHubAppRepo}:ref:refs/heads/${GitHubBranch}'
+                  - !Sub 'repo:${GitHubOrg}@*/${GitHubAppRepo}@*:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AuthTokenIsAccountWide
+                Effect: Allow
+                Action: 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Sid: PushToThisRepositoryOnly
+                Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:PutImage'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                Resource: !Ref EcrRepositoryArn
+
+        - PolicyName: publish-deploy-config
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # taskdef.json and appspec.yaml, zipped. The pipeline reads this
+              # object; the app repo is the only thing that writes it.
+              - Sid: UploadDeployConfig
+                Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/config/*'
+
+              # So the workflow resolves the bucket and repository names
+              # instead of carrying them as repository secrets.
+              - Sid: ResolvePublishedNames
+                Effect: Allow
+                Action: 'ssm:GetParameter'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/artifact-bucket'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/ecr-repository-name'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/task-role-arn'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/task-execution-role-arn'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/db-proxy-endpoint'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/db-secret-arn'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/cache-endpoint'
+
+  # --- Published ------------------------------------------------------------
+
+  # taskdef.json names both of these. The app repo's workflow resolves them
+  # at build time rather than carrying an account id in a committed file.
+  TaskRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/task-role-arn'
+      Type: String
+      Value: !GetAtt TaskRole.Arn
+
+  TaskExecutionRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/task-execution-role-arn'
+      Type: String
+      Value: !GetAtt TaskExecutionRole.Arn
+
+  # The app repo's workflow resolves this instead of holding it as a secret.
+  GitHubAppRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/gha-app-role-arn'
+      Type: String
+      Value: !GetAtt GitHubAppRole.Arn
+
+Outputs:
+  GitHubAppRoleArn:
+    Description: Set as secret AWS_ROLE_ARN in the application repository
+    Value: !GetAtt GitHubAppRole.Arn
+
+  ProxyRoleArn:
+    Value: !GetAtt ProxyRole.Arn
+
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+
+  CodeDeployRoleArn:
+    Value: !GetAtt CodeDeployRole.Arn
+
+  PipelineRoleArn:
+    Value: !GetAtt PipelineRole.Arn
+
+  EventBridgeRoleArn:
+    Value: !GetAtt EventBridgeRole.Arn

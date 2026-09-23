@@ -1,0 +1,3 @@
+# Pinned so a new release fails on the commit that bumps it, not on someone
+# else's unrelated push. setup-python keys its pip cache on this file.
+cfn-lint==1.56.1

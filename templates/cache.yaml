@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket cache - Redis, read-through in front of the database
+
+Parameters:
+  ProjectName:
+    Type: String
+
+  CacheSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+
+  CacheSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  CacheNodeType:
+    Type: String
+    AllowedValues:
+      - cache.t4g.micro
+      - cache.t4g.small
+      - cache.t3.micro
+      - cache.t3.small
+
+  CacheEngineVersion:
+    Type: String
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+
+  SubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${ProjectName}-cache'
+      Description: !Sub '${ProjectName} isolated cache subnets'
+      SubnetIds: !Ref CacheSubnetIds
+
+  # Left to ElastiCache this has no retention and outlives the stack.
+  SlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/elasticache/${ProjectName}/slow'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    DeletionPolicy: Delete
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-cache'
+      ReplicationGroupDescription: !Sub '${ProjectName} read cache'
+      Engine: redis
+      EngineVersion: !Ref CacheEngineVersion
+      CacheNodeType: !Ref CacheNodeType
+      # One per AZ, so a zone loss is a failover rather than a cold cache.
+      NumCacheClusters: 2
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      CacheSubnetGroupName: !Ref SubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroupId
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      AutoMinorVersionUpgrade: true
+      # Nothing here is worth restoring; a cold cache refills from the database.
+      SnapshotRetentionLimit: 0
+      PreferredMaintenanceWindow: 'sun:04:30-sun:05:30'
+      LogDeliveryConfigurations:
+        - DestinationType: cloudwatch-logs
+          DestinationDetails:
+            CloudWatchLogsDetails:
+              LogGroup: !Ref SlowLogGroup
+          LogFormat: json
+          LogType: slow-log
+
+  # Read by the app repo's workflow when it renders taskdef.json.
+  PrimaryEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/cache-endpoint'
+      Type: String
+      Value: !GetAtt ReplicationGroup.PrimaryEndPoint.Address
+
+Outputs:
+  PrimaryEndpoint:
+    Description: Where writes and invalidations go
+    Value: !GetAtt ReplicationGroup.PrimaryEndPoint.Address
+
+  ReplicationGroupId:
+    Description: Dimension value for the alarms in monitoring.yaml
+    Value: !Ref ReplicationGroup

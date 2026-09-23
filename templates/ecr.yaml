@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket container registry - the ECR repository
+
+Parameters:
+  ProjectName:
+    Type: String
+
+  KeepImages:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 3
+    Description: >-
+      The running image plus one or two rollback targets. A lifecycle rule will
+      expire an image a task definition still pins, so two is the practical floor.
+
+Resources:
+
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      # Mutable on purpose: moving :latest is what fires the EventBridge rule.
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # :latest is the only tag, so earlier images go untagged. tagStatus any
+      # counts those too, which keeps the previous image alive for a rollback.
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${KeepImages}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # Read by the app repo's workflow, so the image name is not a secret there.
+  RepositoryNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/ecr-repository-name'
+      Type: String
+      Value: !Ref Repository
+
+Outputs:
+  RepositoryArn:
+    Value: !GetAtt Repository.Arn
+
+  RepositoryName:
+    Value: !Ref Repository

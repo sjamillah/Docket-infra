@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::LanguageExtensions
+Description: docket VPC - subnets, routing, and nothing else
+
+Mappings:
+  # Keys become logical ids. Bits is 32 minus the prefix: 6 is a /26.
+  PrivateTiers:
+    App:
+      Block: '10.30.1.0/24'
+      Bits: '6'
+      Name: app
+    Data:
+      Block: '10.30.2.0/24'
+      Bits: '5'
+      Name: data
+    Cache:
+      Block: '10.30.3.0/24'
+      Bits: '5'
+      Name: cache
+
+  Zones:
+    A:
+      Index: '0'
+    B:
+      Index: '1'
+
+Parameters:
+  ProjectName:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+
+  VpcCidr:
+    Type: String
+
+  PublicTierCidr:
+    Type: String
+    Description: Split into two /26 subnets, one per AZ. The private tiers are in Mappings.
+
+Resources:
+
+  # --- VPC and internet gateway ---------------------------------------------
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      # Both are required for PrivateDnsEnabled on the interface endpoints.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public subnets -------------------------------------------------------
+
+  # Not looped: these differ from the private tiers in addressing and routing.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      # 10.30.0.0/26
+      CidrBlock: !Select
+        - 0
+        - !Cidr
+          - !Ref PublicTierCidr
+          - 2
+          - 6
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+        - Key: Tier
+          Value: public
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      # 10.30.0.64/26
+      CidrBlock: !Select
+        - 1
+        - !Cidr
+          - !Ref PublicTierCidr
+          - 2
+          - 6
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-b'
+        - Key: Tier
+          Value: public
+
+  # --- Private subnets ------------------------------------------------------
+
+  # Three tiers by two zones: ECS, the database and the cache each get their own.
+  Fn::ForEach::PrivateTiers:
+    - Tier
+    - - App
+      - Data
+      - Cache
+    - 'Fn::ForEach::Zones${Tier}':
+        - Zone
+        - - A
+          - B
+        - ${Tier}Subnet${Zone}:
+            Type: AWS::EC2::Subnet
+            Properties:
+              VpcId: !Ref Vpc
+              CidrBlock: !Select
+                - !FindInMap
+                    - Zones
+                    - !Ref Zone
+                    - Index
+                - !Cidr
+                  - !FindInMap
+                      - PrivateTiers
+                      - !Ref Tier
+                      - Block
+                  - 2
+                  - !FindInMap
+                      - PrivateTiers
+                      - !Ref Tier
+                      - Bits
+              AvailabilityZone: !Select
+                - !FindInMap
+                    - Zones
+                    - !Ref Zone
+                    - Index
+                - !GetAZs ''
+              MapPublicIpOnLaunch: false
+              Tags:
+                - Key: Name
+                  Value: !Sub
+                    - '${ProjectName}-${Short}-${Zone}'
+                    - Short: !FindInMap
+                        - PrivateTiers
+                        - !Ref Tier
+                        - Name
+                - Key: Tier
+                  Value: !Sub
+                    - 'private-${Short}'
+                    - Short: !FindInMap
+                        - PrivateTiers
+                        - !Ref Tier
+                        - Name
+
+  # --- Routing --------------------------------------------------------------
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rt-public'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # One per AZ, no default route: the S3 gateway endpoint is the only way out.
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rt-private-a'
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rt-private-b'
+
+  # Literal ids: interpolating the loop variable into a !Ref blinds cfn-lint.
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  AppSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  AppSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  DataSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  DataSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  CacheSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref CacheSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  CacheSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref CacheSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+
+  PublicSubnets:
+    Value: !Join
+      - ','
+      - - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+  AppSubnets:
+    Value: !Join
+      - ','
+      - - !Ref AppSubnetA
+        - !Ref AppSubnetB
+
+  DataSubnets:
+    Value: !Join
+      - ','
+      - - !Ref DataSubnetA
+        - !Ref DataSubnetB
+
+  CacheSubnets:
+    Value: !Join
+      - ','
+      - - !Ref CacheSubnetA
+        - !Ref CacheSubnetB
+
+  PrivateRouteTables:
+    Description: What the S3 gateway endpoint attaches to
+    Value: !Join
+      - ','
+      - - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB

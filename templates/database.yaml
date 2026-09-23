@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket database - PostgreSQL behind an RDS Proxy
+
+Parameters:
+  ProjectName:
+    Type: String
+
+  DataSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+
+  DbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  ProxySecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  ProxyRoleArn:
+    Type: String
+    Description: Lets the proxy read the master secret RDS generated.
+
+  DbName:
+    Type: String
+
+  DbInstanceClass:
+    Type: String
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+
+  DbEngineVersion:
+    Type: String
+    Description: Major version only; RDS picks the latest supported minor.
+
+  DbMultiAZ:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName} isolated data subnets'
+      SubnetIds: !Ref DataSubnetIds
+
+  # Left to RDS this is created with no expiry and outlives the stack.
+  DbLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${ProjectName}-db/postgresql'
+      RetentionInDays: !Ref LogRetentionDays
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # So the group exists, with a retention period, before RDS looks for it.
+    DependsOn: DbLogGroup
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      DBName: !Ref DbName
+      MasterUsername: docketadmin
+      # RDS generates, stores and rotates it. No password enters the template.
+      ManageMasterUserPassword: true
+      AllocatedStorage: '20'
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !Ref DbMultiAZ
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroupId
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '02:00-03:00'
+      PreferredMaintenanceWindow: 'sun:03:30-sun:04:30'
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      EnableCloudwatchLogsExports:
+        - postgresql
+
+  # --- Proxy ----------------------------------------------------------------
+
+  Proxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub '${ProjectName}-proxy'
+      EngineFamily: POSTGRESQL
+      RoleArn: !Ref ProxyRoleArn
+      VpcSubnetIds: !Ref DataSubnetIds
+      VpcSecurityGroupIds:
+        - !Ref ProxySecurityGroupId
+      Auth:
+        - AuthScheme: SECRETS
+          # The secret RDS made for the master user, not one of ours.
+          SecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+          IAMAuth: DISABLED
+      RequireTLS: true
+      # Long enough to survive a failover, short enough to release a leak.
+      IdleClientTimeout: 1800
+      DebugLogging: false
+
+  ProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref Proxy
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+        - !Ref Database
+      ConnectionPoolConfigurationInfo:
+        # Headroom on a db.t3.micro, rather than every connection it has.
+        MaxConnectionsPercent: 80
+        MaxIdleConnectionsPercent: 40
+        ConnectionBorrowTimeout: 120
+
+  # taskdef.json names both of these, and the app repo's workflow renders it.
+  # Published here so the endpoint is read from the stack that creates it.
+  ProxyEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/db-proxy-endpoint'
+      Type: String
+      Value: !GetAtt Proxy.Endpoint
+
+  DbSecretArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/db-secret-arn'
+      Type: String
+      Value: !GetAtt Database.MasterUserSecret.SecretArn
+
+Outputs:
+  ProxyEndpoint:
+    Description: What the application connects to, in place of the instance
+    Value: !GetAtt Proxy.Endpoint
+
+  DbSecretArn:
+    Description: Generated and rotated by RDS, read by the task at start
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+
+  DbInstanceIdentifier:
+    Description: Dimension value for the alarms in monitoring.yaml
+    Value: !Ref Database
+
+  ProxyName:
+    Value: !Ref Proxy

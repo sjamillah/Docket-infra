@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: docket main stack - composes the eleven templates in templates/
+
+# The last four children are conditional: nothing runs before CI pushes an image.
+
+Metadata:
+  # Referenced by path; make package rewrites these into bucket URLs.
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W3002
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - ProjectName
+      - Label:
+          default: Addressing
+        Parameters:
+          - VpcCidr
+          - PublicTierCidr
+          - S3PrefixListId
+      - Label:
+          default: Database
+        Parameters:
+          - DbName
+          - DbPort
+          - DbInstanceClass
+          - DbEngineVersion
+          - DbMultiAZ
+      - Label:
+          default: Cache
+        Parameters:
+          - CachePort
+          - CacheNodeType
+          - CacheEngineVersion
+      - Label:
+          default: Application
+        Parameters:
+          - DeployApplication
+          - TriggerImageTag
+          - ContainerPort
+          - TaskCpu
+          - TaskMemory
+          - MinCapacity
+          - MaxCapacity
+          - CpuTargetPercent
+      - Label:
+          default: Source control
+        Parameters:
+          - GitHubOrg
+          - GitHubAppRepo
+          - GitHubBranch
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: docket
+
+  VpcCidr:
+    Type: String
+    Default: 10.30.0.0/20
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: An IPv4 CIDR block, for example 10.30.0.0/20.
+
+  PublicTierCidr:
+    Type: String
+    Default: 10.30.0.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: An IPv4 CIDR block, for example 10.30.0.0/24.
+
+  # The four values below resolve from Parameter Store, all of them written
+  # by the bootstrap stack. Nothing account-specific is committed here.
+  S3PrefixListId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /docket/s3-prefix-list-id
+
+  DbName:
+    Type: String
+    Default: docket
+
+  DbPort:
+    Type: Number
+    Default: 5432
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+
+  DbEngineVersion:
+    Type: String
+    Default: '16'
+
+  DbMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CachePort:
+    Type: Number
+    Default: 6379
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+
+  CacheEngineVersion:
+    Type: String
+    Default: '7.1'
+
+  # Read from Parameter Store so no address is committed. AllowedPattern is
+  # gone because it would validate the key, not the value it resolves to.
+  AlertEmail:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /docket/alert-email
+    Description: Where alarms are delivered.
+
+  # In the deployment file, not Parameter Store: changing it there is itself
+  # the commit that makes Git sync deploy the second pass.
+  DeployApplication:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      false on the first pass, which builds the registry. Push an image, then
+      set it to true: the service cannot start without one.
+
+  TriggerImageTag:
+    Type: String
+    Default: latest
+    Description: Moving tag the EventBridge rule watches.
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+
+  TaskCpu:
+    Type: String
+    Default: '512'
+
+  TaskMemory:
+    Type: String
+    Default: '1024'
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+
+  MaxCapacity:
+    Type: Number
+    Default: 4
+
+  CpuTargetPercent:
+    Type: Number
+    Default: 60
+
+  GitHubOrg:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /docket/github-org
+
+  # Used only by the OIDC trust policy in iam.yaml. The pipeline no longer
+  # reads the app repository; it reads what the app repository uploads.
+  GitHubAppRepo:
+    Type: String
+    Default: Docket-app
+
+  GitHubBranch:
+    Type: String
+    Default: main
+
+  DeployConfigObjectKey:
+    Type: String
+    Default: config/deploy.zip
+    Description: Where the app repo's workflow puts taskdef.json and appspec.yaml.
+
+Conditions:
+  DeployApplication: !Equals
+    - !Ref DeployApplication
+    - 'true'
+
+Resources:
+
+  EcrStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/ecr.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+
+  # Unconditional: the app repo uploads here before the pipeline exists.
+  ArtifactsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/artifacts.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+        ArtifactBucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+
+  AlertsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/alerts.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+        AlertEmail: !Ref AlertEmail
+
+  VpcStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/network.yaml
+      TimeoutInMinutes: 20
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcCidr: !Ref VpcCidr
+        PublicTierCidr: !Ref PublicTierCidr
+
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/security.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        VpcCidr: !Ref VpcCidr
+        ContainerPort: !Ref ContainerPort
+        DbPort: !Ref DbPort
+        CachePort: !Ref CachePort
+        S3PrefixListId: !Ref S3PrefixListId
+
+  # What replaces a NAT gateway.
+  EndpointsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/endpoints.yaml
+      TimeoutInMinutes: 20
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        AppSubnetIds: !GetAtt VpcStack.Outputs.AppSubnets
+        RouteTableIds: !GetAtt VpcStack.Outputs.PrivateRouteTables
+        EndpointSecurityGroupId: !GetAtt SecurityStack.Outputs.VpcEndpointSecurityGroupId
+
+  # Roles are created before what they grant access to, so the name is passed.
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/iam.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EcrRepositoryArn: !GetAtt EcrStack.Outputs.RepositoryArn
+        GitHubOrg: !Ref GitHubOrg
+        GitHubAppRepo: !Ref GitHubAppRepo
+        GitHubBranch: !Ref GitHubBranch
+        ArtifactBucketName: !GetAtt ArtifactsStack.Outputs.BucketName
+        PipelineName: !Sub '${ProjectName}-pipeline'
+
+  RdsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/database.yaml
+      TimeoutInMinutes: 60
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DataSubnetIds: !GetAtt VpcStack.Outputs.DataSubnets
+        DbSecurityGroupId: !GetAtt SecurityStack.Outputs.DbSecurityGroupId
+        ProxySecurityGroupId: !GetAtt SecurityStack.Outputs.ProxySecurityGroupId
+        ProxyRoleArn: !GetAtt IamStack.Outputs.ProxyRoleArn
+        DbName: !Ref DbName
+        DbInstanceClass: !Ref DbInstanceClass
+        DbEngineVersion: !Ref DbEngineVersion
+        DbMultiAZ: !Ref DbMultiAZ
+
+  CacheStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/cache.yaml
+      TimeoutInMinutes: 45
+      Parameters:
+        ProjectName: !Ref ProjectName
+        CacheSubnetIds: !GetAtt VpcStack.Outputs.CacheSubnets
+        CacheSecurityGroupId: !GetAtt SecurityStack.Outputs.CacheSecurityGroupId
+        CacheNodeType: !Ref CacheNodeType
+        CacheEngineVersion: !Ref CacheEngineVersion
+
+  EcsStack:
+    Condition: DeployApplication
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/service.yaml
+      TimeoutInMinutes: 30
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        PublicSubnetIds: !GetAtt VpcStack.Outputs.PublicSubnets
+        AppSubnetIds: !GetAtt VpcStack.Outputs.AppSubnets
+        AlbSecurityGroupId: !GetAtt SecurityStack.Outputs.AlbSecurityGroupId
+        EcsSecurityGroupId: !GetAtt SecurityStack.Outputs.EcsSecurityGroupId
+        TaskExecutionRoleArn: !GetAtt IamStack.Outputs.TaskExecutionRoleArn
+        TaskRoleArn: !GetAtt IamStack.Outputs.TaskRoleArn
+        # Must not move: ECS refuses to retask a CODE_DEPLOY service.
+        ImageUri: !Sub
+          - '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repo}:${Tag}'
+          - Repo: !GetAtt EcrStack.Outputs.RepositoryName
+            Tag: !Ref TriggerImageTag
+        ProxyEndpoint: !GetAtt RdsStack.Outputs.ProxyEndpoint
+        DbSecretArn: !GetAtt RdsStack.Outputs.DbSecretArn
+        DbName: !Ref DbName
+        DbPort: !Ref DbPort
+        CacheEndpoint: !GetAtt CacheStack.Outputs.PrimaryEndpoint
+        CachePort: !Ref CachePort
+        ContainerPort: !Ref ContainerPort
+        TaskCpu: !Ref TaskCpu
+        TaskMemory: !Ref TaskMemory
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        CpuTargetPercent: !Ref CpuTargetPercent
+
+  CodeDeployStack:
+    Condition: DeployApplication
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/codedeploy.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+        AlertTopicArn: !GetAtt AlertsStack.Outputs.TopicArn
+        CodeDeployRoleArn: !GetAtt IamStack.Outputs.CodeDeployRoleArn
+        ClusterName: !GetAtt EcsStack.Outputs.ClusterName
+        ServiceName: !GetAtt EcsStack.Outputs.ServiceName
+        TargetGroupBlueName: !GetAtt EcsStack.Outputs.TargetGroupBlueName
+        TargetGroupGreenName: !GetAtt EcsStack.Outputs.TargetGroupGreenName
+        ListenerArn: !GetAtt EcsStack.Outputs.ListenerArn
+        LoadBalancerFullName: !GetAtt EcsStack.Outputs.LoadBalancerFullName
+
+  CodePipelineStack:
+    Condition: DeployApplication
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/pipeline.yaml
+      TimeoutInMinutes: 20
+      Parameters:
+        ProjectName: !Ref ProjectName
+        ArtifactBucketName: !GetAtt ArtifactsStack.Outputs.BucketName
+        PipelineName: !Sub '${ProjectName}-pipeline'
+        AlertTopicArn: !GetAtt AlertsStack.Outputs.TopicArn
+        DeployConfigObjectKey: !Ref DeployConfigObjectKey
+        PipelineRoleArn: !GetAtt IamStack.Outputs.PipelineRoleArn
+        EventBridgeRoleArn: !GetAtt IamStack.Outputs.EventBridgeRoleArn
+        EcrRepositoryName: !GetAtt EcrStack.Outputs.RepositoryName
+        TriggerImageTag: !Ref TriggerImageTag
+        CodeDeployApplicationName: !GetAtt CodeDeployStack.Outputs.ApplicationName
+        CodeDeployDeploymentGroupName: !GetAtt CodeDeployStack.Outputs.DeploymentGroupName
+
+  CloudWatchStack:
+    Condition: DeployApplication
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/monitoring.yaml
+      TimeoutInMinutes: 15
+      Parameters:
+        ProjectName: !Ref ProjectName
+        AlertTopicArn: !GetAtt AlertsStack.Outputs.TopicArn
+        DbInstanceIdentifier: !GetAtt RdsStack.Outputs.DbInstanceIdentifier
+        ProxyName: !GetAtt RdsStack.Outputs.ProxyName
+        CacheReplicationGroupId: !GetAtt CacheStack.Outputs.ReplicationGroupId
+        LoadBalancerFullName: !GetAtt EcsStack.Outputs.LoadBalancerFullName
+        TargetGroupBlueFullName: !GetAtt EcsStack.Outputs.TargetGroupBlueFullName
+        ClusterName: !GetAtt EcsStack.Outputs.ClusterName
+        ServiceName: !GetAtt EcsStack.Outputs.ServiceName
+        MaxCapacity: !Ref MaxCapacity
+
+Outputs:
+
+  # The app repo's AWS_ROLE_ARN. Needed on the first pass, so not conditional.
+  GitHubAppRoleArn:
+    Description: Role GitHub Actions in the app repository assumes
+    Value: !GetAtt IamStack.Outputs.GitHubAppRoleArn
+
+  ApplicationUrl:
+    Condition: DeployApplication
+    Description: Public application endpoint
+    Value: !Sub
+      - 'http://${Dns}'
+      - Dns: !GetAtt EcsStack.Outputs.DnsName
+
+  ProxyEndpoint:
+    Description: What the task connects to, in place of the instance
+    Value: !GetAtt RdsStack.Outputs.ProxyEndpoint
+
+  CacheEndpoint:
+    Value: !GetAtt CacheStack.Outputs.PrimaryEndpoint
+
+  ClusterName:
+    Condition: DeployApplication
+    Value: !GetAtt EcsStack.Outputs.ClusterName
+
+  ServiceName:
+    Condition: DeployApplication
+    Value: !GetAtt EcsStack.Outputs.ServiceName
+
+  PipelineName:
+    Condition: DeployApplication
+    Value: !GetAtt CodePipelineStack.Outputs.PipelineName
