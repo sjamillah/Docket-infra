@@ -8,7 +8,7 @@ Everything here is CloudFormation, deployed through Git sync.
 
 ## Stack layout
 
-One stack this repository deploys; twelve CloudFormation creates for you.
+One stack this repository deploys; thirteen CloudFormation creates for you.
 
 | Stack | Repository | Deployed by |
 |---|---|---|
@@ -21,7 +21,7 @@ before this one. Nothing here refers to it except through Parameter Store.
 
 | File | Holds |
 |---|---|
-| `main.yaml` | The parent, referencing the twelve templates below by path |
+| `main.yaml` | The parent, referencing the thirteen templates below by path |
 | `main.packaged.yaml` | What Git sync deploys. Written by `make package`, committed with the change |
 | `templates/ecr.yaml` | The container registry, built on the first pass |
 | `templates/alerts.yaml` | The SNS topic every alarm and the pipeline publish to |
@@ -30,7 +30,7 @@ before this one. Nothing here refers to it except through Parameter Store.
 | `templates/endpoints.yaml` | The gateway and interface endpoints that replace a NAT gateway |
 | `templates/database.yaml` | PostgreSQL, the RDS Proxy, and the proxy target group |
 | `templates/cache.yaml` | Redis replication group, Multi-AZ with automatic failover |
-| `templates/iam.yaml` | Every role the running system assumes, and the parameters naming them |
+| `templates/iam.yaml` | The six roles the running system assumes, and the parameters naming them |
 | `templates/service.yaml` | Load balancer, target group pair, cluster, task, service, scaling |
 | `templates/codedeploy.yaml` | Blue/green, and the two alarms that gate a cutover |
 | `templates/artifacts.yaml` | The artifact bucket, where the app repo drops its deploy config |
@@ -95,9 +95,9 @@ there by whatever needs it.
 step 3, so it cannot deploy itself the first time. The command and its
 parameters are in the [bootstrap repository](https://github.com/sjamillah/Docket-bootstrap).
 
-It publishes `/docket/github-org`, `/docket/alert-email`,
-`/docket/s3-prefix-list-id`, `/docket/template-bucket` and the three role
-ARNs. Nothing here needs to be created by hand afterwards:
+It publishes `/docket/alert-email`, `/docket/template-bucket`, the four role
+ARNs, and `/docket/s3-prefix-list-id`, which it looks up rather than being
+told. Nothing here needs to be created by hand afterwards:
 
 ```bash
 R=$(aws configure get region)
@@ -153,11 +153,13 @@ repository needs in step 6.
 
 | Name | Kind | Source |
 |---|---|---|
-| `AWS_ROLE_ARN` | secret | `/docket/gha-app-role-arn` |
+| `AWS_ROLE_ARN` | secret | `/docket/gha-app-role-arn`, published by **bootstrap** |
 | `AWS_REGION` | variable | the same region |
 
-The ECR repository name, the artifact bucket and both task role ARNs are
-resolved from Parameter Store by the workflow, so they are not secrets.
+That role is bootstrap's, not this stack's, so it exists from step 1 — but the
+workflow cannot succeed until this stack has run once, because it resolves the
+registry, the artifact bucket, both task role ARNs and the two endpoints from
+parameters that only exist afterwards.
 
 **6. Push the application.** One run does two things: uploads
 `config/deploy.zip`, holding the rendered `taskdef.json` and `appspec.yaml`,
@@ -196,9 +198,11 @@ on a missing source rather than on anything to do with the image.
 
 ## Roles
 
-Nothing is created by hand in the console. The three in the bootstrap
-repository have to exist before anything is deployed; the seven in
-`iam.yaml` belong to the running system.
+Nothing is created by hand in the console. The four in the bootstrap
+repository are deployment identity — the two GitHub Actions roles and the two
+Git sync assumes — and have to exist before anything here is deployed. The six
+in `iam.yaml` belong to the running system and nothing outside it can assume
+them.
 
 | Role | Assumed by | Permitted to |
 |---|---|---|
@@ -240,7 +244,7 @@ without an eviction would be invisible until the TTL.
 
 **Nested children over separate stacks.** Children take parameters rather than
 `Fn::ImportValue`, so nothing locks: an export cannot be changed or deleted
-while an import exists, which would turn teardown into twelve deletes in a fixed
+while an import exists, which would turn teardown into thirteen deletes in a fixed
 order.
 
 **Every log group is declared.** RDS, ElastiCache and Lambda all create their

@@ -1,5 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: docket IAM - every role except the ones needed before this stack exists
+Description: docket IAM - the roles the running system assumes
+
+# CI identity is not here. The two GitHub Actions roles live in the bootstrap
+# stack, beside the Git sync roles, because they are deployment identity
+# rather than anything this stack creates.
 
 Parameters:
   ProjectName:
@@ -7,14 +11,6 @@ Parameters:
 
   # Passed from main.yaml: roles precede the resources they grant access to.
   ArtifactBucketName:
-    Type: String
-  EcrRepositoryArn:
-    Type: String
-  GitHubOrg:
-    Type: String
-  GitHubAppRepo:
-    Type: String
-  GitHubBranch:
     Type: String
   PipelineName:
     Type: String
@@ -203,73 +199,6 @@ Resources:
                 Action: 'codepipeline:StartPipelineExecution'
                 Resource: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}'
 
-  GitHubAppRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${ProjectName}-gha-app'
-      Description: GitHub Actions in the application repo, pushing images to ECR
-      MaxSessionDuration: 3600
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
-            Action: 'sts:AssumeRoleWithWebIdentity'
-            Condition:
-              StringEquals:
-                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
-              StringLike:
-                # GitHub appends numeric ids on rename; the literal @ anchors it.
-                'token.actions.githubusercontent.com:sub':
-                  - !Sub 'repo:${GitHubOrg}/${GitHubAppRepo}:ref:refs/heads/${GitHubBranch}'
-                  - !Sub 'repo:${GitHubOrg}@*/${GitHubAppRepo}@*:ref:refs/heads/${GitHubBranch}'
-      Policies:
-        - PolicyName: ecr-push
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: AuthTokenIsAccountWide
-                Effect: Allow
-                Action: 'ecr:GetAuthorizationToken'
-                Resource: '*'
-              - Sid: PushToThisRepositoryOnly
-                Effect: Allow
-                Action:
-                  - 'ecr:BatchCheckLayerAvailability'
-                  - 'ecr:InitiateLayerUpload'
-                  - 'ecr:UploadLayerPart'
-                  - 'ecr:CompleteLayerUpload'
-                  - 'ecr:PutImage'
-                  - 'ecr:BatchGetImage'
-                  - 'ecr:GetDownloadUrlForLayer'
-                Resource: !Ref EcrRepositoryArn
-
-        - PolicyName: publish-deploy-config
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # taskdef.json and appspec.yaml, zipped. The pipeline reads this
-              # object; the app repo is the only thing that writes it.
-              - Sid: UploadDeployConfig
-                Effect: Allow
-                Action: 's3:PutObject'
-                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/config/*'
-
-              # So the workflow resolves the bucket and repository names
-              # instead of carrying them as repository secrets.
-              - Sid: ResolvePublishedNames
-                Effect: Allow
-                Action: 'ssm:GetParameter'
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/artifact-bucket'
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/ecr-repository-name'
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/task-role-arn'
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/task-execution-role-arn'
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/db-proxy-endpoint'
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/db-secret-arn'
-                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/cache-endpoint'
-
   # --- Published ------------------------------------------------------------
 
   # taskdef.json names both of these. The app repo's workflow resolves them
@@ -288,19 +217,7 @@ Resources:
       Type: String
       Value: !GetAtt TaskExecutionRole.Arn
 
-  # The app repo's workflow resolves this instead of holding it as a secret.
-  GitHubAppRoleArnParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/${ProjectName}/gha-app-role-arn'
-      Type: String
-      Value: !GetAtt GitHubAppRole.Arn
-
 Outputs:
-  GitHubAppRoleArn:
-    Description: Set as secret AWS_ROLE_ARN in the application repository
-    Value: !GetAtt GitHubAppRole.Arn
-
   ProxyRoleArn:
     Value: !GetAtt ProxyRole.Arn
 

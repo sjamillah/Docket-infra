@@ -48,11 +48,9 @@ Metadata:
           - MaxCapacity
           - CpuTargetPercent
       - Label:
-          default: Source control
+          default: Deployment
         Parameters:
-          - GitHubOrg
-          - GitHubAppRepo
-          - GitHubBranch
+          - DeployConfigObjectKey
 
 Parameters:
 
@@ -72,8 +70,9 @@ Parameters:
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
     ConstraintDescription: An IPv4 CIDR block, for example 10.30.0.0/24.
 
-  # The four values below resolve from Parameter Store, all of them written
-  # by the bootstrap stack. Nothing account-specific is committed here.
+  # Both values below resolve from Parameter Store, written by the bootstrap
+  # stack. Nothing account-specific is committed here, and nothing is typed:
+  # the prefix list id is looked up there rather than entered.
   S3PrefixListId:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /docket/s3-prefix-list-id
@@ -161,20 +160,6 @@ Parameters:
     Type: Number
     Default: 60
 
-  GitHubOrg:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /docket/github-org
-
-  # Used only by the OIDC trust policy in iam.yaml. The pipeline no longer
-  # reads the app repository; it reads what the app repository uploads.
-  GitHubAppRepo:
-    Type: String
-    Default: Docket-app
-
-  GitHubBranch:
-    Type: String
-    Default: main
-
   DeployConfigObjectKey:
     Type: String
     Default: config/deploy.zip
@@ -259,10 +244,6 @@ Resources:
       TimeoutInMinutes: 15
       Parameters:
         ProjectName: !Ref ProjectName
-        EcrRepositoryArn: !GetAtt EcrStack.Outputs.RepositoryArn
-        GitHubOrg: !Ref GitHubOrg
-        GitHubAppRepo: !Ref GitHubAppRepo
-        GitHubBranch: !Ref GitHubBranch
         ArtifactBucketName: !GetAtt ArtifactsStack.Outputs.BucketName
         PipelineName: !Sub '${ProjectName}-pipeline'
 
@@ -382,11 +363,6 @@ Resources:
         MaxCapacity: !Ref MaxCapacity
 
 Outputs:
-
-  # The app repo's AWS_ROLE_ARN. Needed on the first pass, so not conditional.
-  GitHubAppRoleArn:
-    Description: Role GitHub Actions in the app repository assumes
-    Value: !GetAtt IamStack.Outputs.GitHubAppRoleArn
 
   ApplicationUrl:
     Condition: DeployApplication

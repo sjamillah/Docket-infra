@@ -55,8 +55,5 @@ Resources:
       Value: !Ref Repository
 
 Outputs:
-  RepositoryArn:
-    Value: !GetAtt Repository.Arn
-
   RepositoryName:
     Value: !Ref Repository
