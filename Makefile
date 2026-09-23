@@ -8,6 +8,7 @@ BUCKET    = $(shell aws ssm get-parameter --name /$(PROJECT)/template-bucket \
 # Staging always overwrites the same prefix, so there is nothing to look up.
 PREFIX    = latest
 ARTIFACTS = $(PROJECT)-artifacts-$(ACCOUNT)-$(REGION)
+VERSIONS  = --query '{Objects: (Versions||`[]`)[].{Key:Key,VersionId:VersionId} + (DeleteMarkers||`[]`)[].{Key:Key,VersionId:VersionId}}' --output json
 
 .PHONY: lint package verify empty
 
@@ -35,9 +36,20 @@ verify: package
 # CloudFormation cannot empty a bucket, and will not delete one that still
 # holds objects. That gap is the only part of teardown worth automating.
 # Deleting the stacks is a decision, not a chore, so it stays yours.
+#
+# The artifact bucket is versioned, because a CodePipeline S3 source action
+# requires that. `rm --recursive` only writes delete markers there, so the
+# bucket stays non-empty and the stack delete stalls on it; the loop below
+# drops every version and marker a page at a time.
 empty:
 	@test "$(CONFIRM)" = "$(PROJECT)" || (echo "refusing. run: make empty CONFIRM=$(PROJECT)"; exit 1)
 	@test -n "$(ACCOUNT)" || (echo "cannot resolve the account. no credentials?"; exit 1)
 	@test -n "$(BUCKET)" || (echo "cannot resolve the template bucket. wrong region?"; exit 1)
-	bash scripts/empty-buckets.sh "$(ARTIFACTS)" "$(BUCKET)"
-	@echo "now delete $(PROJECT)-main, then $(PROJECT)-bootstrap"
+	-aws s3 rm "s3://$(ARTIFACTS)" --recursive
+	aws s3 rm "s3://$(BUCKET)" --recursive
+	@batch=$$(aws s3api list-object-versions --bucket "$(ARTIFACTS)" $(VERSIONS) 2>/dev/null); \
+	while echo "$$batch" | grep -q '"Key"'; do \
+	  aws s3api delete-objects --bucket "$(ARTIFACTS)" --delete "$$batch" >/dev/null; \
+	  batch=$$(aws s3api list-object-versions --bucket "$(ARTIFACTS)" $(VERSIONS) 2>/dev/null); \
+	done
+	@echo "emptied. now delete $(PROJECT)-main, then $(PROJECT)-bootstrap"

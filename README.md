@@ -235,7 +235,7 @@ the secret does not give you.
 **The proxy is not optional decoration.** Fargate tasks come and go, and each
 one opening its own PostgreSQL connections is what exhausts a `db.t3.micro`.
 The proxy holds a warm pool, survives a failover without dropping clients, and
-is why Hikari is capped at five connections per task.
+is why the application's pool is capped at five connections per task.
 
 **The cache is read-through with whole-list eviction.** The list is small and
 eviction that is obviously correct beats eviction that is clever. A test asserts
@@ -275,10 +275,11 @@ make empty CONFIRM=docket
 Two buckets, both holding only regenerable build artefacts: the artifact bucket
 belongs to `docket-main`, the template bucket to `docket-bootstrap`. The
 artifact bucket *is* versioned, because a CodePipeline S3 source action
-requires it, so `rm --recursive` alone would leave delete markers behind —
-`scripts/empty-buckets.sh` drops every version explicitly. `CONFIRM` is
-required because emptying the template bucket of a *live* stack breaks its
-next update until you run `make package` again.
+requires it, so `rm --recursive` alone would leave delete markers behind and
+the stack delete would stall; the `empty` target loops over
+`list-object-versions` until nothing is left. `CONFIRM` is required because
+emptying the template bucket of a *live* stack breaks its next update until
+you run `make package` again.
 
 **3. Delete the stacks yourself** — `docket-main` first, then
 `docket-bootstrap`. Console, or `aws cloudformation delete-stack`. Delete one

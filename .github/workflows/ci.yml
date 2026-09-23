@@ -1,14 +1,12 @@
 name: CI
 
 on:
-  pull_request:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
   workflow_dispatch:
 
-# Nothing is written back to the repository: you commit main.packaged.yaml
-# yourself, and this job checks that what you committed is what the templates
-# produce.
 permissions:
   contents: read
 
@@ -23,6 +21,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+
     steps:
       - uses: actions/checkout@v7
 
@@ -32,20 +31,17 @@ jobs:
           # Keyed on requirements.txt, so cfn-lint comes from cache.
           cache: pip
 
-      - run: pip install -r requirements.txt
-
-      # Pull requests stop here: no credentials, no S3.
-      - if: github.event_name == 'pull_request'
-        run: make lint
-
-      - if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@v6
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: ci-${{ github.run_id }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      - name: Install
+        run: pip install -r requirements.txt
+
       # Git sync has already deployed the commit you pushed. This is the check
-      # that the packaged file in it was honest, not a gate.
-      - if: github.event_name != 'pull_request'
+      # that the packaged file in it was honest, not a gate. Repackaging must
+      # be a no-op, or main.packaged.yaml is stale.
+      - name: Verify
         run: make verify
